@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 #include <regex.h>
 #include <pthread.h>
 
@@ -83,6 +84,7 @@ aggregator_add_compute(
 {
 	struct _aggr_computes *ac = s->computes;
 	enum _aggr_compute_type act;
+	char store = 0;
 
 	if (strcmp(type, "sum") == 0) {
 		act = SUM;
@@ -94,6 +96,18 @@ aggregator_add_compute(
 		act = MIN;
 	} else if (strcmp(type, "average") == 0 || strcmp(type, "avg") == 0) {
 		act = AVG;
+	} else if (strcmp(type, "rate") == 0) {
+		act = RATE;
+		store = 1;
+	} else if (strcmp(type, "median") == 0) {
+		act = MEDN;
+		store = 1;
+	} else if (strcmp(type, "variance") == 0) {
+		act = VAR;
+		store = 1;
+	} else if (strcmp(type, "stddev") == 0) {
+		act = SDEV;
+		store = 1;
 	} else {
 		return -1;
 	}
@@ -109,6 +123,7 @@ aggregator_add_compute(
 	ac->type = act;
 	ac->metric = strdup(metric);
 	memset(ac->invocations_ht, 0, sizeof(ac->invocations_ht));
+	ac->entries_needed = store;
 	ac->next = NULL;
 
 	return 0;
@@ -133,7 +148,6 @@ aggregator_putmetric(
 	long long int epoch;
 	long long int itime;
 	int slot;
-	struct _bucket *bucket;
 	char newmetric[METRIC_BUFSIZ];
 	char *newfirstspace = NULL;
 	size_t len;
@@ -143,6 +157,8 @@ aggregator_putmetric(
 	unsigned int omhtbucket;
 	struct _aggr_computes *compute;
 	struct _aggr_invocations *invocation;
+	struct _aggr_bucket *bucket;
+	struct _aggr_bucket_entries *entries;
 
 	/* get value */
 	if ((v = strchr(firstspace + 1, ' ')) == NULL) {
@@ -214,7 +230,7 @@ aggregator_putmetric(
 
 			/* allocate enough buckets to hold the past + future */
 			invocation->buckets =
-				malloc(sizeof(struct _bucket) * s->bucketcnt);
+				malloc(sizeof(struct _aggr_bucket) * s->bucketcnt);
 			if (invocation->buckets == NULL) {
 				logerr("aggregator: out of memory creating %s from %s",
 						ometric, metric);
@@ -253,18 +269,33 @@ aggregator_putmetric(
 
 		bucket = &invocation->buckets[slot];
 		if (bucket->cnt == 0) {
-			bucket->cnt = 1;
 			bucket->sum = val;
 			bucket->max = val;
 			bucket->min = val;
 		} else {
-			bucket->cnt++;
 			bucket->sum += val;
 			if (bucket->max < val)
 				bucket->max = val;
 			if (bucket->min > val)
 				bucket->min = val;
 		}
+		entries = &bucket->entries;
+		if (compute->entries_needed) {
+			if (bucket->cnt == entries->size) {
+#define E_I_SZ 64
+				double *new = realloc(entries->values, entries->size + E_I_SZ);
+				if (new == NULL) {
+					logerr("aggregator: out of memory creating entry bucket "
+							"(%s from %s)", ometric, metric);
+				} else {
+					entries->values = new;
+					entries->size += E_I_SZ;
+				}
+			}
+			if (bucket->cnt < entries->size)
+				entries->values[bucket->cnt] = val;
+		}
+		bucket->cnt++;
 	}
 	pthread_mutex_unlock(&s->bucketlock);
 
@@ -282,11 +313,13 @@ aggregator_expire(void *sub)
 {
 	time_t now;
 	aggregator *s;
-	struct _bucket *b;
+	struct _aggr_bucket *b;
+	struct _aggr_bucket_entries *e;
 	struct _aggr_computes *c;
 	struct _aggr_invocations *inv;
 	struct _aggr_invocations *lastinv;
 	int i;
+	unsigned char j;
 	int work;
 	server *submission = (server *)sub;
 	char metric[METRIC_BUFSIZ];
@@ -343,6 +376,21 @@ aggregator_expire(void *sub)
 												b->sum / (double)b->cnt,
 												b->start + s->interval);
 										break;
+									case RATE:
+									case MEDN:
+									case VAR:
+									case SDEV: {
+										e = &b->entries;
+										double avg = b->sum / (double)b->cnt;
+										double ksum = 0;
+										for (i = 0; i < b->cnt; i++)
+											ksum += pow(e->values[i] - avg, 2);
+										snprintf(metric, sizeof(metric),
+												"%s %f %lld\n",
+												inv->metric,
+												sqrt(ksum / (double)b->cnt),
+												b->start + s->interval);
+									}	break;
 								}
 								server_send(submission, strdup(metric), 1);
 								s->sent++;
@@ -364,7 +412,6 @@ aggregator_expire(void *sub)
 						}
 
 						if (isempty) {
-							int j;
 							/* see if the remaining buckets are empty too */
 							pthread_mutex_lock(&s->bucketlock);
 							for (j = 0; j < s->bucketcnt; j++) {
@@ -377,6 +424,10 @@ aggregator_expire(void *sub)
 						}
 						if (isempty) {
 							/* free and unlink */
+							if (c->entries_needed)
+								for (j = 0; j < s->bucketcnt; j++)
+									if (inv->buckets[j].entries.values)
+										free(inv->buckets[j].entries.values);
 							free(inv->metric);
 							free(inv->buckets);
 							if (lastinv != NULL) {
