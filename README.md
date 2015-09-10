@@ -59,7 +59,7 @@ cluster <name>
         </path/to/file> ...
     ;
 match <* | <expression>>
-    send to <cluster | blackhole>
+    <send to | fnv1a_h> <cluster | blackhole | all>
     [stop]
     ;
 rewrite <expression>

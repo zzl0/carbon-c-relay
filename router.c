@@ -31,6 +31,7 @@
 #include "aggregator.h"
 #include "relay.h"
 #include "router.h"
+#include "fnv1a.h"
 
 enum clusttype {
 	BLACKHOLE,  /* /dev/null-like destination */
@@ -44,6 +45,11 @@ enum clusttype {
 	FAILOVER,   /* ordered attempt delivery list */
 	AGGREGATION,
 	REWRITE
+};
+
+enum routetype {
+	ROUTE_FORWARD,
+	ROUTE_FNV1A_H   /* FNV1a-based hash */
 };
 
 typedef struct _servers {
@@ -77,7 +83,13 @@ struct _cluster {
 	struct _cluster *next;
 };
 
+typedef struct {
+	int count;
+	cluster **clusters;
+} clusterlist;
+
 struct _route {
+	enum routetype route_type;
 	char *pattern;    /* original regex input, used for printing only */
 	regex_t rule;     /* regex on metric, only if type == REGEX */
 	size_t nmatch;    /* number of match groups */
@@ -89,16 +101,17 @@ struct _route {
 		REGEX,        /* a regex match */
 		CONTAINS,     /* find string occurrence */
 		STARTS_WITH,  /* metric must start with string */
-		ENDS_WITH,    /* metric must end with string */ 
+		ENDS_WITH,    /* metric must end with string */
 		MATCHES       /* metric matches string exactly */
 	} matchtype;      /* how to interpret the pattern */
+	clusterlist *cluster_list;
 	struct _route *next;
 };
 
 static char keep_running = 1;
 
 /* custom constant, meant to force regex mode matching */
-#define REG_FORCE   01000000 
+#define REG_FORCE   01000000
 
 /**
  * Examines pattern and sets matchtype and rule or strmatch in route.
@@ -203,6 +216,44 @@ determine_if_regex(route *r, char *pat, int flags)
 	return 0;
 }
 
+static void
+router_set_cluster_list(route *topr, clusterlist *cluster_list) {
+	route *tmpr = topr;
+	while (tmpr != NULL)
+	{
+		tmpr->cluster_list = cluster_list;
+		tmpr = tmpr->next;
+	}
+}
+
+static clusterlist *
+clusterlist_new(int cluster_count, cluster *topcl) {
+	clusterlist *cluster_list = (clusterlist *)malloc(sizeof(clusterlist));
+	cluster_list->count = cluster_count;
+	size_t size = sizeof(cluster *) * cluster_count;
+	cluster_list->clusters = (cluster **)malloc(size);
+
+	int i = 0;
+	cluster *c = topcl;
+	while (c != NULL) {
+		if (strcmp(c->name, "blackhole") != 0)
+			cluster_list->clusters[i++] = c;
+		c = c->next;
+	}
+	assert(i == cluster_count);
+	return cluster_list;
+}
+
+static void
+clusterlist_free(clusterlist *cluster_list)
+{
+	if (cluster_list == NULL)
+		return;
+	if (cluster_list->clusters != NULL)
+		free(cluster_list->clusters);
+	free(cluster_list);
+}
+
 /**
  * Populates the routing tables by reading the config file.
  *
@@ -262,6 +313,8 @@ router_readconfig(cluster **clret, route **rret,
 	route *topr = NULL;
 	struct addrinfo *saddrs;
 	char matchcatchallfound = 0;
+	int cluster_count = 0;
+
 
 	if (stat(path, &st) == -1)
 		return 0;
@@ -700,12 +753,14 @@ router_readconfig(cluster **clret, route **rret,
 			}
 			cl->name = strdup(name);
 			cl->next = NULL;
+			cluster_count++;
 		} else if (strncmp(p, "match", 5) == 0 && isspace(*(p + 5))) {
 			/* match rule */
 			char *pat;
 			char *dest;
 			char stop = -1;
-			cluster *w;
+			cluster *w = NULL;
+            enum routetype route_type;
 
 			p += 6;
 			for (; *p != '\0' && isspace(*p); p++)
@@ -721,27 +776,35 @@ router_readconfig(cluster **clret, route **rret,
 			*p++ = '\0';
 			for (; *p != '\0' && isspace(*p); p++)
 				;
-			if (strncmp(p, "send", 4) != 0 || !isspace(*(p + 4))) {
-				logerr("expected 'send to' after match %s\n", pat);
+
+			if (strncmp(p, "fnv1a_h", 7) == 0 && isspace(*(p + 7))) {
+				route_type = ROUTE_FNV1A_H;
+				p += 8;
+			} else if (strncmp(p, "send", 4) == 0 && isspace(*(p + 4))) {
+				route_type = ROUTE_FORWARD;
+				p += 5;
+				for (; *p != '\0' && isspace(*p); p++)
+					;
+				if (strncmp(p, "to", 2) != 0 || !isspace(*(p + 2))) {
+					logerr("expected '<send to> or <fnv1a_h>' after match %s\n", pat);
+					free(buf);
+					return 0;
+				}
+				p += 3;
+			} else {
+				logerr("expected '<send to> or <fnv1a_h>' after match %s\n", pat);
 				free(buf);
 				return 0;
 			}
-			p += 5;
-			for (; *p != '\0' && isspace(*p); p++)
-				;
-			if (strncmp(p, "to", 2) != 0 || !isspace(*(p + 2))) {
-				logerr("expected 'send to' after match %s\n", pat);
-				free(buf);
-				return 0;
-			}
-			p += 3;
+
 			for (; *p != '\0' && isspace(*p); p++)
 				;
 			dest = p;
 			for (; *p != '\0' && !isspace(*p) && *p != ';'; p++)
 				;
 			if (*p == '\0') {
-				logerr("unexpected end of file after 'send to %s'\n",
+				logerr("unexpected end of file after '%s %s'\n",
+						route_type == ROUTE_FNV1A_H ? "fnv1a_h": "send to",
 						dest);
 				free(buf);
 				return 0;
@@ -782,24 +845,34 @@ router_readconfig(cluster **clret, route **rret,
 				}
 			}
 
-			/* lookup dest */
-			for (w = topcl; w != NULL; w = w->next) {
-				if (w->type != GROUP &&
-						w->type != AGGREGATION &&
-						w->type != REWRITE &&
-						strcmp(w->name, dest) == 0)
-					break;
-			}
-			if (w == NULL) {
-				logerr("no such cluster '%s' for 'match %s'\n", dest, pat);
-				free(buf);
-				return 0;
+			if (route_type == ROUTE_FNV1A_H) {
+				if(strcmp(dest, "all") != 0) {
+					logerr("fnv1a type for route now only support 'all'");
+					free(buf);
+					return 0;
+				}
+			} else {
+				/* lookup dest */
+				for (w = topcl; w != NULL; w = w->next) {
+					if (w->type != GROUP &&
+							w->type != AGGREGATION &&
+							w->type != REWRITE &&
+							strcmp(w->name, dest) == 0)
+						break;
+				}
+				if (w == NULL) {
+					logerr("no such cluster '%s' for 'match %s'\n", dest, pat);
+					free(buf);
+					return 0;
+				}
 			}
 			if (r == NULL) {
 				topr = r = malloc(sizeof(route));
 			} else {
 				r = r->next = malloc(sizeof(route));
 			}
+
+			r->route_type = route_type;
 			r->dest = w;
 			if (strcmp(pat, "*") == 0) {
 				r->pattern = NULL;
@@ -817,7 +890,11 @@ router_readconfig(cluster **clret, route **rret,
 					return 0;
 				}
 			}
-			r->stop = w->type == BLACKHOLE ? 1 : stop;
+			if (w != NULL) {
+				r->stop = w->type == BLACKHOLE ? 1 : stop;
+			} else {
+				r->stop = stop;
+			}
 			r->next = NULL;
 
 			if (matchcatchallfound) {
@@ -1163,6 +1240,8 @@ router_readconfig(cluster **clret, route **rret,
 	} while (*p != '\0');
 
 	free(buf);
+	clusterlist *cluster_list = clusterlist_new(cluster_count, topcl);
+	router_set_cluster_list(topr, cluster_list);
 	*clret = topcl;
 	*rret = topr;
 	return 1;
@@ -1526,7 +1605,12 @@ router_printconfig(FILE *f, char mode, cluster *clusters, route *routes)
 	}
 	fprintf(f, "\n");
 	for (r = routes; r != NULL; r = r->next) {
-		if (r->dest->type == AGGREGATION) {
+		if (r->dest == NULL) {
+			fprintf(f, "match %s\n    fnv1a_h %s%s\n    ;\n",
+					r->matchtype == MATCHALL ? "*" : r->pattern,
+					"all",
+					r->stop ? "\n    stop" : "");
+		} else if (r->dest->type == AGGREGATION) {
 			cluster *aggr = r->dest;
 			struct _aggr_computes *ac;
 
@@ -1563,7 +1647,7 @@ router_printconfig(FILE *f, char mode, cluster *clusters, route *routes)
 			char blockname[64];
 			char *b = &blockname[sizeof(blockname) - 1];
 			char *p;
-			
+
 			for (rwalk = r->dest->members.routes; rwalk != NULL; rwalk = rwalk->next)
 				cnt++;
 			/* reverse the name, to make it human consumable */
@@ -1592,6 +1676,8 @@ router_free(cluster *clusters, route *routes)
 	cluster *c;
 	route *r;
 	servers *s;
+
+	clusterlist_free(routes->cluster_list);
 
 	while (routes != NULL) {
 		if (routes->dest->type == GROUP)
@@ -1852,14 +1938,22 @@ router_route_intern(
 
 
 	for (w = r; w != NULL && keep_running; w = w->next) {
-		if (w->dest->type == GROUP) {
+		cluster *dest = NULL;
+		if (w->route_type == ROUTE_FNV1A_H) {
+			int idx = fnv1a_hash32(metric, firstspace) % w->cluster_list->count;
+			dest = w->cluster_list->clusters[idx];
+		} else {
+			dest = w->dest;
+		}
+
+		if (dest->type == GROUP) {
 			/* strrstr doesn't exist, grrr
 			 * therefore the pattern in the group is stored in reverse,
 			 * such that we can start matching the tail easily without
 			 * having to calculate the end of the pattern string all the
 			 * time */
 			for (p = firstspace - 1; p >= metric; p--) {
-				for (q = w->dest->name, t = p; *q != '\0' && t >= metric; q++, t--) {
+				for (q = dest->name, t = p; *q != '\0' && t >= metric; q++, t--) {
 					if (*q != *t)
 						break;
 				}
@@ -1876,11 +1970,11 @@ router_route_intern(
 						srcaddr,
 						metric,
 						firstspace,
-						w->dest->members.routes);
+						dest->members.routes);
 		} else if (router_metric_matches(w, metric, firstspace, pmatch)) {
 			stop = w->stop;
 			/* rule matches, send to destination(s) */
-			switch (w->dest->type) {
+			switch (dest->type) {
 				case BLACKHOLE: {
 					/* maybe just record we're dropping this metric? */
 				}	break;
@@ -1899,7 +1993,7 @@ router_route_intern(
 				case FORWARD: {
 					/* simple case, no logic necessary */
 					servers *s;
-					for (s = w->dest->members.forward; s != NULL; s = s->next)
+					for (s = dest->members.forward; s != NULL; s = s->next)
 					{
 						failif(retsize, *curlen + 1);
 						ret[*curlen].dest = s->server;
@@ -1918,10 +2012,10 @@ router_route_intern(
 					 * (MAX_INT % c) can be considered neglicible given
 					 * the number of occurances of c in the range of
 					 * MAX_INT, therefore we stick with a simple mod. */
-					hash %= w->dest->members.anyof->count;
+					hash %= dest->members.anyof->count;
 					failif(retsize, *curlen + 1);
 					ret[*curlen].dest =
-						w->dest->members.anyof->servers[hash];
+						dest->members.anyof->servers[hash];
 					ret[(*curlen)++].metric = strdup(metric);
 				}	break;
 				case FAILOVER: {
@@ -1930,8 +2024,8 @@ router_route_intern(
 
 					failif(retsize, *curlen + 1);
 					ret[*curlen].dest = NULL;
-					for (i = 0; i < w->dest->members.anyof->count; i++) {
-						server *s = w->dest->members.anyof->servers[i];
+					for (i = 0; i < dest->members.anyof->count; i++) {
+						server *s = dest->members.anyof->servers[i];
 						if (server_failed(s))
 							continue;
 						ret[*curlen].dest = s;
@@ -1939,26 +2033,26 @@ router_route_intern(
 					}
 					if (ret[*curlen].dest == NULL)
 						/* all failed, take first server */
-						ret[*curlen].dest = w->dest->members.anyof->servers[0];
+						ret[*curlen].dest = dest->members.anyof->servers[0];
 					ret[(*curlen)++].metric = strdup(metric);
 				}	break;
 				case CARBON_CH:
 				case FNV1A_CH: {
 					/* let the ring(bearer) decide */
 					failif(retsize,
-							*curlen + w->dest->members.ch->repl_factor);
+							*curlen + dest->members.ch->repl_factor);
 					ch_get_nodes(
 							&ret[*curlen],
-							w->dest->members.ch->ring,
-							w->dest->members.ch->repl_factor,
+							dest->members.ch->ring,
+							dest->members.ch->repl_factor,
 							metric,
 							firstspace);
-					*curlen += w->dest->members.ch->repl_factor;
+					*curlen += dest->members.ch->repl_factor;
 				}	break;
 				case AGGREGATION: {
 					/* aggregation rule */
 					aggregator_putmetric(
-							w->dest->members.aggregation,
+							dest->members.aggregation,
 							metric,
 							firstspace,
 							w->nmatch, pmatch);
@@ -1968,13 +2062,13 @@ router_route_intern(
 					if ((len = router_rewrite_metric(
 								&newmetric, &newfirstspace,
 								metric, firstspace,
-								w->dest->members.replacement,
+								dest->members.replacement,
 								w->nmatch, pmatch)) == 0)
 					{
 						logerr("router_route: failed to rewrite "
 								"metric: newmetric size too small to hold "
 								"replacement (%s -> %s)\n",
-								metric, w->dest->members.replacement);
+								metric, dest->members.replacement);
 						break;
 					};
 
@@ -2163,7 +2257,7 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 					destination dst[CONN_DESTS_SIZE];
 					int i;
 
-					fprintf(stdout, "    %s_ch(%s)\n", 
+					fprintf(stdout, "    %s_ch(%s)\n",
 							w->dest->type == FNV1A_CH ? "fnv1a" : "carbon",
 							w->dest->name);
 					if (mode == DEBUGTEST) {
