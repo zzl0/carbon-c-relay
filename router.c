@@ -43,6 +43,7 @@ enum clusttype {
 	FNV1A_CH,   /* FNV1a-based consistent-hash */
 	ANYOF,      /* FNV1a-based hash, but with backup by others */
 	FAILOVER,   /* ordered attempt delivery list */
+	FNV1A_H,
 	AGGREGATION,
 	REWRITE
 };
@@ -64,6 +65,12 @@ typedef struct {
 	servers *list;
 } serverlist;
 
+typedef struct {
+	unsigned short group_count;
+	servers **groups;
+	servers *list;
+} servergroup;
+
 struct _cluster {
 	char *name;
 	enum clusttype type;
@@ -71,6 +78,7 @@ struct _cluster {
 		chashring *ch;
 		servers *forward;
 		serverlist *anyof;
+		servergroup *hashgroup;
 		aggregator *aggregation;
 		struct _route *routes;
 		char *replacement;
@@ -210,7 +218,7 @@ determine_if_regex(route *r, char *pat, int flags)
  * Config file supports the following:
  *
  * cluster (name)
- *     (forward | any_of [useall] | failover | (carbon|fnv1a)_ch [replication (count)])
+ *     (forward | any_of [useall] | failover | fnv1a_h | (carbon|fnv1a)_ch [replication (count)])
  *         (ip:port[=instance] [proto (tcp | udp)] ...)
  *     ;
  * cluster (name)
@@ -394,6 +402,18 @@ router_readconfig(cluster **clret, route **rret,
 				}
 				cl->type = FAILOVER;
 				cl->members.anyof = NULL;
+			} else if (strncmp(p, "fnv1a_h", 7) == 0 && isspace(*(p + 7))) {
+				p += 8;
+
+				for (; *p != '\0' && isspace(*p); p++)
+					;
+				if ((cl = cl->next = malloc(sizeof(cluster))) == NULL) {
+					logerr("malloc failed in cluster fnv1a_h\n");
+					free(buf);
+					return 0;
+				}
+				cl->type = FNV1A_H;
+				cl->members.hashgroup = NULL;
 			} else if (strncmp(p, "file", 4) == 0 && isspace(*(p + 4))) {
 				p += 5;
 
@@ -461,7 +481,7 @@ router_readconfig(cluster **clret, route **rret,
 				termchr = *p;
 				*p = '\0';
 
-				if (cl->type == CARBON_CH || cl->type == FNV1A_CH) {
+				if (cl->type == CARBON_CH || cl->type == FNV1A_CH || cl->type == FNV1A_H) {
 					if (inst != NULL) {
 						*inst = '\0';
 						p = inst++;
@@ -470,8 +490,9 @@ router_readconfig(cluster **clret, route **rret,
 						inst = NULL;
 				}
 
-				if (*(p - 1) == ']')
+				if (*(p - 1) == ']') {
 					lastcolon = NULL;
+				}
 				if (lastcolon != NULL) {
 					char *endp = NULL;
 					*lastcolon = '\0';
@@ -607,6 +628,10 @@ router_readconfig(cluster **clret, route **rret,
 						return 0;
 					}
 
+					if ((cl->type == CARBON_CH || cl->type == FNV1A_CH || cl->type == FNV1A_H)
+								&& inst != NULL)
+						server_set_instance(newserver, inst);
+
 					if (cl->type == CARBON_CH || cl->type == FNV1A_CH) {
 						if (w == NULL) {
 							cl->members.ch->servers = w =
@@ -622,9 +647,6 @@ router_readconfig(cluster **clret, route **rret,
 							return 0;
 						}
 						w->next = NULL;
-						if ((cl->type == CARBON_CH || cl->type == FNV1A_CH)
-								&& inst != NULL)
-							server_set_instance(newserver, inst);
 						w->server = newserver;
 						cl->members.ch->ring = ch_addnode(
 								cl->members.ch->ring,
@@ -640,6 +662,7 @@ router_readconfig(cluster **clret, route **rret,
 					} else if (cl->type == FORWARD ||
 							cl->type == ANYOF ||
 							cl->type == FAILOVER ||
+							cl->type == FNV1A_H ||
 							cl->type == FILELOG ||
 							cl->type == FILELOGIP)
 					{
@@ -653,6 +676,7 @@ router_readconfig(cluster **clret, route **rret,
 									cl->type == FORWARD ? "forward" :
 									cl->type == ANYOF ? "any_of" :
 									cl->type == FAILOVER ? "failover" :
+									cl->type == FNV1A_H ? "fnv1a_h" :
 									"file",
 									ip);
 							free(cl);
@@ -662,9 +686,10 @@ router_readconfig(cluster **clret, route **rret,
 						w->next = NULL;
 						w->server = newserver;
 						if ((cl->type == FORWARD ||
-							 cl->type == FILELOG || cl->type == FILELOGIP)
-									&& cl->members.forward == NULL)
+							 cl->type == FILELOG ||
+							 cl->type == FILELOGIP) && cl->members.forward == NULL) {
 							cl->members.forward = w;
+						}
 						if (cl->type == ANYOF || cl->type == FAILOVER) {
 							if (cl->members.anyof == NULL) {
 								cl->members.anyof = malloc(sizeof(serverlist));
@@ -675,8 +700,15 @@ router_readconfig(cluster **clret, route **rret,
 								cl->members.anyof->count++;
 							}
 						}
+						if (cl->type == FNV1A_H){
+							if (cl->members.hashgroup == NULL) {
+								cl->members.hashgroup = malloc(sizeof(servergroup));
+								cl->members.hashgroup->groups = NULL;
+								cl->members.hashgroup->list = w;
+								cl->members.hashgroup->group_count = 0;
+							}
+						}
 					}
-
 					walk = next;
 				}
 
@@ -697,6 +729,33 @@ router_readconfig(cluster **clret, route **rret,
 							cl->members.anyof->count);
 					if (cl->type == FAILOVER)
 						server_set_failover(w->server);
+				}
+			} else if (cl->type == FNV1A_H) {
+				for (w = cl->members.hashgroup->list; w != NULL; w = w->next) {
+					if (!server_set_group_id(w->server)) {
+						logerr("group id error for %s:%d=%s\n",
+							   server_ip(w->server),
+							   server_port(w->server),
+							   server_instance(w->server));
+						free(cl);
+						free(buf);
+						return 0;
+					}
+					/* group_count = max(group_id) + 1 */
+					if ((server_group_id(w->server) + 1) > cl->members.hashgroup->group_count) {
+						cl->members.hashgroup->group_count = server_group_id(w->server) + 1;
+					}
+				}
+				size_t size = sizeof(servers *) * cl->members.hashgroup->group_count;
+				cl->members.hashgroup->groups = malloc(size);
+				memset(cl->members.hashgroup->groups, 0, size);
+
+				servers *tmp = NULL;
+				for (w = cl->members.hashgroup->list; w != NULL;) {
+					tmp = w->next;
+					w->next = cl->members.hashgroup->groups[server_group_id(w->server)];
+					cl->members.hashgroup->groups[server_group_id(w->server)] = w;
+					w = tmp;
 				}
 			}
 			cl->name = strdup(name);
@@ -1479,6 +1538,14 @@ router_getservers(cluster *clusters)
 		} else if (c->type == ANYOF || c->type == FAILOVER) {
 			for (s = c->members.anyof->list; s != NULL; s = s->next)
 				add_server(s->server);
+		} else if (c->type == FNV1A_H) {
+			for (i = 0; i < c->members.hashgroup->group_count; i++) {
+				s = c->members.hashgroup->groups[i];
+				while (s != NULL) {
+					add_server(s->server);
+					s = s->next;
+				}
+			}
 		} else if (c->type == CARBON_CH || c->type == FNV1A_CH) {
 			for (s = c->members.ch->servers; s != NULL; s = s->next)
 				add_server(s->server);
@@ -1500,6 +1567,7 @@ router_printconfig(FILE *f, char mode, cluster *clusters, route *routes)
 	cluster *c;
 	route *r;
 	servers *s;
+	int i;
 
 #define PPROTO \
 	server_ctype(s->server) == CON_UDP ? " proto udp" : ""
@@ -1523,6 +1591,18 @@ router_printconfig(FILE *f, char mode, cluster *clusters, route *routes)
 			for (s = c->members.anyof->list; s != NULL; s = s->next)
 				fprintf(f, "        %s:%d%s\n",
 						server_ip(s->server), server_port(s->server), PPROTO);
+		} else if (c->type == FNV1A_H) {
+			fprintf(f, "    %s\n", "fnv1a_h");
+			for (i = 0; i < c->members.hashgroup->group_count; i++) {
+				s = c->members.hashgroup->groups[i];
+				while (s != NULL) {
+					fprintf(f, "        %s:%d=%d%s\n",
+						server_ip(s->server), server_port(s->server),
+						server_group_id(s->server),
+						PPROTO);
+					s = s->next;
+				}
+			}
 		} else if (c->type == CARBON_CH || c->type == FNV1A_CH) {
 			fprintf(f, "    %s_ch replication %d\n",
 					c->type == CARBON_CH ? "carbon" : "fnv1a",
@@ -1610,6 +1690,8 @@ router_free(cluster *clusters, route *routes)
 	cluster *c;
 	route *r;
 	servers *s;
+	servers *tmp_s;
+	int i;
 
 	while (routes != NULL) {
 		if (routes->dest->type == GROUP)
@@ -1658,6 +1740,21 @@ router_free(cluster *clusters, route *routes)
 				}
 				if (clusters->members.anyof->servers)
 					free(clusters->members.anyof->servers);
+				break;
+			case FNV1A_H:
+				for (i = 0; i < clusters->members.hashgroup->group_count; i++) {
+					s = clusters->members.hashgroup->groups[i];
+					while (s != NULL) {
+						server_shutdown(s->server);
+						tmp_s = s;
+						s = s->next;
+						free(tmp_s);
+					}
+				}
+				if (clusters->members.hashgroup->groups) {
+					free(clusters->members.hashgroup->groups);
+					clusters->members.hashgroup->groups = NULL;
+				}
 				break;
 			case GROUP:
 				/* handled at the routes above */
@@ -1962,6 +2059,20 @@ router_route_intern(
 					ret[(*curlen)++].metric = strdup(metric);
 					*blackholed = 0;
 				}	break;
+				case FNV1A_H: {
+					unsigned int hash = fnv1a_hash32(metric, firstspace);
+					int group_count = w->dest->members.hashgroup->group_count;
+					servers *s;
+					for (s = w->dest->members.hashgroup->groups[hash % group_count];
+						 s != NULL;
+						 s = s->next) {
+						failif(retsize, *curlen + 1);
+						ret[*curlen].dest = s->server;
+						ret[(*curlen)++].metric = strdup(metric);
+					}
+
+					*blackholed = 0;
+				} 	break;
 				case CARBON_CH:
 				case FNV1A_CH: {
 					/* let the ring(bearer) decide */
