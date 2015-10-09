@@ -674,7 +674,9 @@ server_get_ticks(server *s)
 {
 	if (s == NULL)
 		return 0;
-	return s->ticks;
+	size_t val = s->ticks;
+	s->ticks = 0;
+	return val;
 }
 
 /**
@@ -685,7 +687,9 @@ server_get_metrics(server *s)
 {
 	if (s == NULL)
 		return 0;
-	return s->metrics;
+	size_t val = s->metrics;
+	s->metrics = 0;
+	return val;
 }
 
 /**
@@ -696,7 +700,9 @@ server_get_dropped(server *s)
 {
 	if (s == NULL)
 		return 0;
-	return s->dropped;
+	size_t val = s->dropped;
+	s->dropped = 0;
+	return val;
 }
 
 /**
@@ -709,7 +715,9 @@ server_get_stalls(server *s)
 {
 	if (s == NULL)
 		return 0;
-	return s->stalls;
+	size_t val = s->stalls;
+	s->stalls = 0;
+	return val;
 }
 
 /**
